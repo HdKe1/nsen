@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streak Ledger — NSE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="masthead-row">
+      <h1>Streak Ledger</h1>
+      <span class="masthead-tag">NSE · Consecutive-Day Tracker</span>
+    </div>
+    <div class="rule"></div>
+  </header>
+
+  <section class="controls">
+    <form id="report-form">
+      <div class="field">
+        <label for="end-date">Through</label>
+        <input type="date" id="end-date" name="end-date" required>
+      </div>
+
+      <div class="field field-narrow">
+        <label for="n-days">Final date</label>
+        <input type="number" id="n-days" name="n-days" min="1" max="30" value="3" required>
+        <span class="field-suffix">days</span>
+      </div>
+
+      <div class="field field-grow">
+        <button type="submit" id="run-btn">Run</button>
+      </div>
+    </form>
+
+    <details class="symbols-toggle">
+      <summary>Edit symbol list (<span id="symbol-count">—</span> tickers)</summary>
+      <textarea id="symbols" spellcheck="false" placeholder="One NSE symbol per line, e.g.
+RELIANCE
+TCS
+INFY"></textarea>
+    </details>
+  </section>
+
+  <div id="status" class="status" hidden></div>
+
+  <section id="results" class="results" hidden>
+
+    <div class="results-toolbar">
+      <button type="button" id="download-btn" class="secondary-btn">Download Excel</button>
+    </div>
+
+    <div class="ledger-block">
+      <div class="ledger-heading up">
+        <span class="glyph">▲</span>
+        <h2>Up streaks</h2>
+        <span class="count" id="up-count">0</span>
+      </div>
+      <table class="ledger" id="up-table">
+        <thead>
+          <tr>
+            <th class="col-symbol">Symbol</th>
+            <th class="col-days">Daily change</th>
+            <th class="col-net">Net</th>
+            <th class="col-next">Next day</th>
+            <th class="col-verdict">Verdict</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty-note" id="up-empty" hidden>No stocks up every day through the selected window.</p>
+    </div>
+
+    <div class="ledger-block">
+      <div class="ledger-heading down">
+        <span class="glyph">▼</span>
+        <h2>Down streaks</h2>
+        <span class="count" id="down-count">0</span>
+      </div>
+      <table class="ledger" id="down-table">
+        <thead>
+          <tr>
+            <th class="col-symbol">Symbol</th>
+            <th class="col-days">Daily change</th>
+            <th class="col-net">Net</th>
+            <th class="col-next">Next day</th>
+            <th class="col-verdict">Verdict</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty-note" id="down-empty" hidden>No stocks down every day through the selected window.</p>
+    </div>
+
+  </section>
+
+  <footer class="foot">
+    <span>Data via Yahoo Finance · not investment advice</span>
+  </footer>
+
+</div>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
