@@ -193,6 +193,20 @@ button:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
 
 .status.error { color: var(--down); }
 
+.progress-track {
+  margin-top: 10px;
+  height: 2px;
+  background: var(--rule);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--ink);
+  transition: width 0.2s ease;
+}
+
 /* ---------- Results ---------- */
 
 .results {

@@ -14,6 +14,8 @@ const downCountEl = document.getElementById("down-count");
 const upEmptyEl = document.getElementById("up-empty");
 const downEmptyEl = document.getElementById("down-empty");
 const downloadBtn = document.getElementById("download-btn");
+const progressTrack = document.getElementById("progress-track");
+const progressFill = document.getElementById("progress-fill");
 
 let lastRequestBody = null;
 let lastReportData = null;
@@ -131,6 +133,77 @@ function clearStatus() {
   statusEl.hidden = true;
 }
 
+function showProgress() {
+  progressTrack.hidden = false;
+  progressFill.style.width = "0%";
+}
+
+function updateProgress(checked, total) {
+  const pct = total > 0 ? Math.min(100, (checked / total) * 100) : 0;
+  progressFill.style.width = `${pct}%`;
+  setStatus(`Checking symbols… ${checked} / ${total}`);
+}
+
+function hideProgress() {
+  progressTrack.hidden = true;
+  progressFill.style.width = "0%";
+}
+
+/**
+ * Runs the streamed report endpoint, parsing Server-Sent Events as they
+ * arrive. Calls onProgress(checked, total) for each progress event and
+ * resolves with the final report data from the 'done' event.
+ */
+async function runReportStream(requestBody, onProgress) {
+  const res = await fetch("/api/report/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!res.ok || !res.body) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Request failed (${res.status})`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalData = null;
+  let errorDetail = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+
+      const eventMatch = rawEvent.match(/^event: (.+)$/m);
+      const dataMatch = rawEvent.match(/^data: (.+)$/m);
+      if (!eventMatch || !dataMatch) continue;
+
+      const eventType = eventMatch[1];
+      const data = JSON.parse(dataMatch[1]);
+
+      if (eventType === "progress") {
+        onProgress(data.checked, data.total);
+      } else if (eventType === "done") {
+        finalData = data;
+      } else if (eventType === "error") {
+        errorDetail = data.detail;
+      }
+    }
+  }
+
+  if (errorDetail) throw new Error(errorDetail);
+  if (!finalData) throw new Error("Stream ended without a result");
+  return finalData;
+}
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
 
@@ -145,6 +218,7 @@ form.addEventListener("submit", async (e) => {
 
   runBtn.disabled = true;
   resultsEl.hidden = true;
+  showProgress();
   setStatus(`Checking ${symbols.length || "default"} symbols for a ${nDays}-day streak through ${endDate}…`);
 
   const requestBody = {
@@ -154,18 +228,7 @@ form.addEventListener("submit", async (e) => {
   };
 
   try {
-    const res = await fetch("/api/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `Request failed (${res.status})`);
-    }
-
-    const data = await res.json();
+    const data = await runReportStream(requestBody, updateProgress);
 
     upTableBody.innerHTML = "";
     downTableBody.innerHTML = "";
@@ -185,6 +248,7 @@ form.addEventListener("submit", async (e) => {
   } catch (err) {
     setStatus(`Could not complete the run — ${err.message}`, true);
   } finally {
+    hideProgress();
     runBtn.disabled = false;
   }
 });

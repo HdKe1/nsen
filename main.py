@@ -18,6 +18,7 @@ from typing import List, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import io as _io
+import json
 
 import requests
 import yfinance as yf
@@ -392,6 +393,74 @@ def build_excel(report: ReportResponse, n_days: int, end_date: str) -> BytesIO:
 @app.post("/api/report", response_model=ReportResponse)
 def get_report(req: ReportRequest):
     return build_report(req)
+
+
+@app.post("/api/report/stream")
+def stream_report(req: ReportRequest):
+    """Same computation as /api/report, but streams progress events as
+    each symbol finishes checking, then a final 'done' event with the
+    full result -- lets the frontend show a real progress bar instead
+    of a blind spinner."""
+
+    def event_stream():
+        try:
+            datetime.strptime(req.end_date, "%Y-%m-%d")
+        except ValueError:
+            payload = json.dumps({"detail": "end_date must be in YYYY-MM-DD format"})
+            yield f"event: error\ndata: {payload}\n\n"
+            return
+
+        symbols = req.symbols if req.symbols else get_default_symbols(req.end_date)
+        symbols = [s.strip().upper() for s in symbols if s.strip()]
+        total = len(symbols)
+
+        if total == 0:
+            payload = json.dumps({"detail": "No symbols to check"})
+            yield f"event: error\ndata: {payload}\n\n"
+            return
+
+        up_streaks, down_streaks = [], []
+        skipped = 0
+        checked = 0
+        # Throttle progress events on very large lists so we don't send
+        # thousands of tiny SSE messages; always send the first and last.
+        report_every = max(1, total // 200)
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            futures = {
+                pool.submit(evaluate_symbol, sym, req.end_date, req.n_days): sym
+                for sym in symbols
+            }
+            for future in as_completed(futures):
+                checked += 1
+                try:
+                    result = future.result()
+                except Exception:
+                    result = None
+
+                if result is None:
+                    skipped += 1
+                elif result.direction == "Up":
+                    up_streaks.append(result)
+                else:
+                    down_streaks.append(result)
+
+                if checked % report_every == 0 or checked == total:
+                    payload = json.dumps({"checked": checked, "total": total})
+                    yield f"event: progress\ndata: {payload}\n\n"
+
+        up_streaks.sort(key=lambda r: r.net_pct_change, reverse=True)
+        down_streaks.sort(key=lambda r: r.net_pct_change)
+
+        report = ReportResponse(
+            up_streaks=up_streaks,
+            down_streaks=down_streaks,
+            checked=total,
+            skipped=skipped,
+        )
+        yield f"event: done\ndata: {report.model_dump_json()}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/report/excel")
