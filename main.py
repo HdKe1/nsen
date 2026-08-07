@@ -55,12 +55,17 @@ FALLBACK_SYMBOLS = [
     "MOTHERSON", "BOSCHLTD", "MRF", "BALKRISIND", "EXIDEIND",
 ]
 
-_symbol_cache = {"symbols": None, "fetched_at": None}
+# Fallback listing dates are left as None (unknown), meaning "always
+# include" — we only have real listing dates via the live NSE fetch.
+FALLBACK_ENTRIES = [{"symbol": s, "listing_date": None} for s in FALLBACK_SYMBOLS]
+
+_symbol_cache = {"entries": None, "fetched_at": None}
 
 
-def fetch_all_nse_symbols() -> List[str]:
-    """Fetch NSE's official list of all listed equity symbols. Falls back
-    to a curated ~100-stock list if the request fails for any reason.
+def fetch_all_nse_entries() -> List[dict]:
+    """Fetch NSE's official list of all listed equities, including each
+    stock's listing date. Falls back to a curated ~100-stock list (with
+    unknown listing dates) if the request fails for any reason.
 
     NSE's site blocks bare requests, so we warm up a session against the
     homepage first (like a browser would) to pick up the cookies it expects."""
@@ -78,23 +83,55 @@ def fetch_all_nse_symbols() -> List[str]:
         resp = session.get(NSE_EQUITY_LIST_URL, timeout=20)
         resp.raise_for_status()
         reader = csv.DictReader(_io.StringIO(resp.text))
-        symbols = [row["SYMBOL"].strip() for row in reader if row.get("SYMBOL", "").strip()]
-        if not symbols:
+        fieldnames = reader.fieldnames or []
+        symbol_key = next((f for f in fieldnames if f.strip().upper() == "SYMBOL"), "SYMBOL")
+        listing_key = next((f for f in fieldnames if f.strip().upper() == "DATE OF LISTING"), None)
+
+        entries = []
+        for row in reader:
+            symbol = (row.get(symbol_key) or "").strip()
+            if not symbol:
+                continue
+            listing_date = None
+            raw_date = (row.get(listing_key) or "").strip() if listing_key else ""
+            if raw_date:
+                try:
+                    listing_date = pd.Timestamp(datetime.strptime(raw_date, "%d-%b-%Y"))
+                except ValueError:
+                    listing_date = None  # unparseable, treat as unknown -> always include
+            entries.append({"symbol": symbol, "listing_date": listing_date})
+
+        if not entries:
             raise ValueError("Parsed symbol list was empty")
-        return symbols
+        return entries
     except Exception as e:
         print(f"Could not fetch full NSE symbol list ({e}); using fallback list.")
-        return FALLBACK_SYMBOLS
+        return FALLBACK_ENTRIES
 
 
-def get_default_symbols() -> List[str]:
-    """Returns the full NSE symbol list, cached for 24 hours."""
+def get_all_nse_entries() -> List[dict]:
+    """Returns the full NSE entry list (symbol + listing date), cached for 24 hours."""
     now = datetime.utcnow()
     cached_at = _symbol_cache["fetched_at"]
-    if _symbol_cache["symbols"] is None or cached_at is None or (now - cached_at).total_seconds() > 86400:
-        _symbol_cache["symbols"] = fetch_all_nse_symbols()
+    if _symbol_cache["entries"] is None or cached_at is None or (now - cached_at).total_seconds() > 86400:
+        _symbol_cache["entries"] = fetch_all_nse_entries()
         _symbol_cache["fetched_at"] = now
-    return _symbol_cache["symbols"]
+    return _symbol_cache["entries"]
+
+
+def get_default_symbols(end_date: Optional[str] = None) -> List[str]:
+    """Returns NSE symbols, automatically excluding stocks that weren't
+    listed yet as of end_date (if given) -- so a report for e.g. 2015
+    won't waste time checking companies that IPO'd years later."""
+    entries = get_all_nse_entries()
+    if not end_date:
+        return [e["symbol"] for e in entries]
+
+    cutoff = pd.Timestamp(end_date)
+    return [
+        e["symbol"] for e in entries
+        if e["listing_date"] is None or e["listing_date"] <= cutoff
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -247,7 +284,7 @@ def build_report(req: "ReportRequest") -> ReportResponse:
     except ValueError:
         raise HTTPException(status_code=400, detail="end_date must be in YYYY-MM-DD format")
 
-    symbols = req.symbols if req.symbols else get_default_symbols()
+    symbols = req.symbols if req.symbols else get_default_symbols(req.end_date)
     symbols = [s.strip().upper() for s in symbols if s.strip()]
 
     up_streaks, down_streaks = [], []
@@ -370,8 +407,8 @@ def get_report_excel(req: ReportRequest):
 
 
 @app.get("/api/default-symbols")
-def get_default_symbols_route():
-    symbols = get_default_symbols()
+def get_default_symbols_route(end_date: Optional[str] = None):
+    symbols = get_default_symbols(end_date)
     return {"symbols": symbols}
 
 

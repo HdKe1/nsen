@@ -16,22 +16,42 @@ const downEmptyEl = document.getElementById("down-empty");
 const downloadBtn = document.getElementById("download-btn");
 
 let lastRequestBody = null;
+let lastReportData = null;
+let symbolsCustomized = false;
 
 // Default end date = today
 endDateInput.value = new Date().toISOString().slice(0, 10);
 
-// Preload default symbol list into the (collapsed) textarea
-fetch("/api/default-symbols")
-  .then((r) => r.json())
-  .then((data) => {
-    symbolsTextarea.value = data.symbols.join("\n");
-    symbolCountEl.textContent = data.symbols.length;
-  })
-  .catch(() => {
-    symbolCountEl.textContent = "0";
-  });
+function loadDefaultSymbols(endDate) {
+  const url = endDate
+    ? `/api/default-symbols?end_date=${encodeURIComponent(endDate)}`
+    : "/api/default-symbols";
+  return fetch(url)
+    .then((r) => r.json())
+    .then((data) => {
+      symbolsTextarea.value = data.symbols.join("\n");
+      symbolCountEl.textContent = data.symbols.length;
+    })
+    .catch(() => {
+      symbolCountEl.textContent = "0";
+    });
+}
+
+// Preload default symbol list into the (collapsed) textarea, filtered to
+// stocks already listed as of today's default date
+loadDefaultSymbols(endDateInput.value);
+
+// If the person hasn't customized the symbol list, automatically refresh
+// it whenever the final date changes -- so a date from a decade ago
+// won't include companies that hadn't listed yet.
+endDateInput.addEventListener("change", () => {
+  if (!symbolsCustomized) {
+    loadDefaultSymbols(endDateInput.value);
+  }
+});
 
 symbolsTextarea.addEventListener("input", () => {
+  symbolsCustomized = true;
   const count = symbolsTextarea.value
     .split("\n")
     .map((s) => s.trim())
@@ -127,13 +147,6 @@ form.addEventListener("submit", async (e) => {
   resultsEl.hidden = true;
   setStatus(`Checking ${symbols.length || "default"} symbols for a ${nDays}-day streak through ${endDate}…`);
 
-  // If Render's free tier has spun the server down from inactivity, the
-  // first request can take 30–60s to wake it back up. Let the person know
-  // rather than leaving them staring at a stuck spinner.
-  const coldStartTimer = setTimeout(() => {
-    setStatus("Still working — if this is the first request in a while, the server may be waking up from sleep (can take up to a minute)…");
-  }, 6000);
-
   const requestBody = {
     end_date: endDate,
     n_days: nDays,
@@ -168,38 +181,94 @@ form.addEventListener("submit", async (e) => {
     resultsEl.hidden = false;
     clearStatus();
     lastRequestBody = requestBody;
+    lastReportData = data;
   } catch (err) {
     setStatus(`Could not complete the run — ${err.message}`, true);
   } finally {
-    clearTimeout(coldStartTimer);
     runBtn.disabled = false;
   }
 });
 
+function buildStockRow(stock, nDays) {
+  const row = [stock.symbol, `${nDays}-Day ${stock.direction} Streak`, stock.net_pct_change];
+  stock.days.forEach((d) => {
+    row.push(d.pct_change);
+    row.push(d.volume);
+  });
+  row.push(stock.next_day_pct_change ?? "N/A");
+  row.push(stock.next_day_volume ?? "N/A");
+  row.push(stock.verdict);
+  return row;
+}
+
+function addStreakSheet(workbook, sheetName, stocks, nDays) {
+  const sheet = workbook.addWorksheet(sheetName);
+
+  const headers = ["Symbol", "Streak Type", "Net % Change"];
+  for (let i = 1; i <= nDays; i++) {
+    headers.push(`Day ${i} % Change`, `Day ${i} Volume`);
+  }
+  headers.push("Next Day % Change", "Next Day Volume", "Verdict");
+
+  const headerRow = sheet.addRow(headers);
+  headerRow.eachCell((cell) => {
+    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF4472C4" } };
+  });
+
+  const upFill = "FFC6EFCE";
+  const downFill = "FFFFC7CE";
+  const brokenFill = "FFFFEB9C";
+
+  stocks.forEach((stock) => {
+    const dataRow = sheet.addRow(buildStockRow(stock, nDays));
+    const rowFill = stock.direction === "Up" ? upFill : downFill;
+    dataRow.eachCell((cell) => {
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: rowFill } };
+    });
+    if (stock.verdict && stock.verdict.toLowerCase().includes("broken")) {
+      const verdictCell = dataRow.getCell(headers.length);
+      verdictCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: brokenFill } };
+      verdictCell.font = { bold: true };
+    }
+  });
+
+  if (stocks.length === 0) {
+    sheet.getCell("A2").value = "No qualifying stocks for this window.";
+  }
+
+  sheet.columns.forEach((col) => {
+    let maxLen = 10;
+    col.eachCell({ includeEmpty: true }, (cell) => {
+      const len = cell.value ? String(cell.value).length : 0;
+      if (len > maxLen) maxLen = len;
+    });
+    col.width = maxLen + 3;
+  });
+}
+
 downloadBtn.addEventListener("click", async () => {
-  if (!lastRequestBody) return;
+  if (!lastReportData || !lastRequestBody) return;
 
   downloadBtn.disabled = true;
   const originalLabel = downloadBtn.textContent;
   downloadBtn.textContent = "Preparing…";
 
   try {
-    const res = await fetch("/api/report/excel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(lastRequestBody),
+    const nDays = lastRequestBody.n_days;
+    const workbook = new ExcelJS.Workbook();
+
+    addStreakSheet(workbook, `${nDays}-Day Up Streak`, lastReportData.up_streaks, nDays);
+    addStreakSheet(workbook, `${nDays}-Day Down Streak`, lastReportData.down_streaks, nDays);
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `Request failed (${res.status})`);
-    }
-
-    const blob = await res.blob();
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `nse_streak_report_${lastRequestBody.end_date}_n${lastRequestBody.n_days}.xlsx`;
+    a.download = `nse_streak_report_${lastRequestBody.end_date}_n${nDays}.xlsx`;
     document.body.appendChild(a);
     a.click();
     a.remove();
