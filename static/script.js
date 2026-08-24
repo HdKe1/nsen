@@ -16,6 +16,8 @@ const downEmptyEl = document.getElementById("down-empty");
 const downloadBtn = document.getElementById("download-btn");
 const progressTrack = document.getElementById("progress-track");
 const progressFill = document.getElementById("progress-fill");
+const presetSelect = document.getElementById("preset-select");
+const presetStatus = document.getElementById("preset-status");
 
 let lastRequestBody = null;
 let lastReportData = null;
@@ -23,6 +25,53 @@ let symbolsCustomized = false;
 
 // Default end date = today
 endDateInput.value = new Date().toISOString().slice(0, 10);
+
+// Populate the preset dropdown (Nifty 50, Nifty Bank, etc.) from the backend
+fetch("/api/index-presets")
+  .then((r) => r.json())
+  .then((data) => {
+    data.presets.forEach((name) => {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      presetSelect.appendChild(opt);
+    });
+  })
+  .catch(() => {
+    // Preset list just won't populate beyond the default "All NSE" option
+  });
+
+presetSelect.addEventListener("change", () => {
+  const chosen = presetSelect.value;
+  if (!chosen) {
+    // "All NSE" selected -- revert to the date-filtered default list
+    symbolsCustomized = false;
+    presetStatus.textContent = "";
+    presetStatus.className = "preset-status";
+    loadDefaultSymbols(endDateInput.value);
+    return;
+  }
+
+  presetStatus.textContent = "Loading…";
+  presetStatus.className = "preset-status";
+
+  fetch(`/api/index-list?name=${encodeURIComponent(chosen)}`)
+    .then((r) => {
+      if (!r.ok) return r.json().then((e) => { throw new Error(e.detail || "Failed to load"); });
+      return r.json();
+    })
+    .then((data) => {
+      symbolsTextarea.value = data.symbols.join("\n");
+      symbolCountEl.textContent = data.symbols.length;
+      symbolsCustomized = true; // treat a chosen preset like a manual list
+      presetStatus.textContent = `Loaded ${data.symbols.length} symbols`;
+      presetStatus.className = "preset-status";
+    })
+    .catch((err) => {
+      presetStatus.textContent = `Could not load ${chosen} — ${err.message}`;
+      presetStatus.className = "preset-status error";
+    });
+});
 
 function loadDefaultSymbols(endDate) {
   const url = endDate
@@ -71,6 +120,13 @@ function pctClass(value) {
   return value >= 0 ? "pos" : "neg";
 }
 
+function formatCountWithContinued(stocks) {
+  const total = stocks.length;
+  if (total === 0) return "0";
+  const continued = stocks.filter((s) => s.verdict && s.verdict.includes("continued")).length;
+  return continued > 0 ? `${total} (${continued} continued)` : `${total}`;
+}
+
 function renderRow(stock) {
   const tr = document.createElement("tr");
 
@@ -82,9 +138,24 @@ function renderRow(stock) {
   const daysTd = document.createElement("td");
   stock.days.forEach((d) => {
     const chip = document.createElement("span");
-    chip.className = `day-chip ${pctClass(d.pct_change)}`;
-    chip.textContent = fmtPct(d.pct_change);
+    chip.className = "day-chip";
     chip.title = `${d.label} · Volume ${d.volume.toLocaleString("en-IN")}`;
+
+    const priceLine = document.createElement("span");
+    priceLine.className = `price-line ${pctClass(d.pct_change)}`;
+    priceLine.textContent = fmtPct(d.pct_change);
+    chip.appendChild(priceLine);
+
+    const volumeLine = document.createElement("span");
+    if (d.volume_pct_change === null || d.volume_pct_change === undefined) {
+      volumeLine.className = "volume-line";
+      volumeLine.textContent = "vol —";
+    } else {
+      volumeLine.className = `volume-line ${pctClass(d.volume_pct_change)}`;
+      volumeLine.textContent = `vol ${fmtPct(d.volume_pct_change)}`;
+    }
+    chip.appendChild(volumeLine);
+
     daysTd.appendChild(chip);
   });
   tr.appendChild(daysTd);
@@ -236,8 +307,8 @@ form.addEventListener("submit", async (e) => {
     data.up_streaks.forEach((s) => upTableBody.appendChild(renderRow(s)));
     data.down_streaks.forEach((s) => downTableBody.appendChild(renderRow(s)));
 
-    upCountEl.textContent = data.up_streaks.length;
-    downCountEl.textContent = data.down_streaks.length;
+    upCountEl.textContent = formatCountWithContinued(data.up_streaks);
+    downCountEl.textContent = formatCountWithContinued(data.down_streaks);
     upEmptyEl.hidden = data.up_streaks.length > 0;
     downEmptyEl.hidden = data.down_streaks.length > 0;
 
@@ -258,6 +329,7 @@ function buildStockRow(stock, nDays) {
   stock.days.forEach((d) => {
     row.push(d.pct_change);
     row.push(d.volume);
+    row.push(d.volume_pct_change ?? "N/A");
   });
   row.push(stock.next_day_pct_change ?? "N/A");
   row.push(stock.next_day_volume ?? "N/A");
@@ -270,7 +342,7 @@ function addStreakSheet(workbook, sheetName, stocks, nDays) {
 
   const headers = ["Symbol", "Streak Type", "Net % Change"];
   for (let i = 1; i <= nDays; i++) {
-    headers.push(`Day ${i} % Change`, `Day ${i} Volume`);
+    headers.push(`Day ${i} % Change`, `Day ${i} Volume`, `Day ${i} Volume % Change`);
   }
   headers.push("Next Day % Change", "Next Day Volume", "Verdict");
 

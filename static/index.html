@@ -41,6 +41,15 @@
 
     <details class="symbols-toggle">
       <summary>Edit symbol list (<span id="symbol-count">—</span> tickers)</summary>
+
+      <div class="preset-row">
+        <label for="preset-select">Load preset</label>
+        <select id="preset-select">
+          <option value="">All NSE (date-filtered)</option>
+        </select>
+        <span id="preset-status" class="preset-status"></span>
+      </div>
+
       <textarea id="symbols" spellcheck="false" placeholder="One NSE symbol per line, e.g.
 RELIANCE
 TCS

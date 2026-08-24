@@ -1,10 +1,12 @@
 """
 NSE Streak Report — FastAPI backend
 -------------------------------------
-Serves a minimal web UI and a JSON API that fetches NSE stock price
-history (via Yahoo Finance / yfinance), detects N-day consecutive
+Serves a minimal web UI and a JSON API that detects N-day consecutive
 up/down streaks ending on a given date, and reports the next trading
 day's move as a "verdict" (continued / broken / paused).
+
+Fetches price history live from Yahoo Finance on each request. No local
+caching/database -- purely a web app.
 
 Run:
     pip install -r requirements.txt
@@ -17,12 +19,12 @@ from io import BytesIO
 from typing import List, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
-import io as _io
+import io
 import json
 
+import pandas as pd
 import requests
 import yfinance as yf
-import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -33,7 +35,10 @@ from openpyxl.utils import get_column_letter
 
 app = FastAPI(title="NSE Streak Report")
 
-# Official NSE list of all equities currently listed for trading.
+# ----------------------------------------------------------------------
+# NSE / Yahoo Finance data fetching
+# ----------------------------------------------------------------------
+
 NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
 # Small fallback list, used only if the live NSE list can't be fetched
@@ -55,35 +60,58 @@ FALLBACK_SYMBOLS = [
     "PVRINOX", "INDIGO", "AMBUJACEM", "ACC", "SHREECEM", "RAMCOCEM", "DALBHARAT",
     "MOTHERSON", "BOSCHLTD", "MRF", "BALKRISIND", "EXIDEIND",
 ]
-
-# Fallback listing dates are left as None (unknown), meaning "always
-# include" — we only have real listing dates via the live NSE fetch.
 FALLBACK_ENTRIES = [{"symbol": s, "listing_date": None} for s in FALLBACK_SYMBOLS]
 
-_symbol_cache = {"entries": None, "fetched_at": None}
+# Display name -> CSV filename for preset index constituent lists.
+# These follow NSE's standard naming pattern (confirmed working for
+# ind_nifty50list.csv); a few of the less common sector ones are
+# best-effort and may need a filename correction if NSE has renamed them.
+INDEX_LIST_BASE = "https://nsearchives.nseindia.com/content/indices/"
+INDEX_PRESETS = {
+    "Nifty 50": "ind_nifty50list.csv",
+    "Nifty Next 50": "ind_niftynext50list.csv",
+    "Nifty 100": "ind_nifty100list.csv",
+    "Nifty 200": "ind_nifty200list.csv",
+    "Nifty 500": "ind_nifty500list.csv",
+    "Nifty Bank": "ind_niftybanklist.csv",
+    "Nifty IT": "ind_niftyitlist.csv",
+    "Nifty Auto": "ind_niftyautolist.csv",
+    "Nifty Pharma": "ind_niftypharmalist.csv",
+    "Nifty FMCG": "ind_niftyfmcglist.csv",
+    "Nifty Infra": "ind_niftyinfralist.csv",
+    "Nifty Metal": "ind_niftymetallist.csv",
+    "Nifty Energy": "ind_niftyenergylist.csv",
+    "Nifty Realty": "ind_niftyrealtylist.csv",
+}
+
+_NSE_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+def _nse_session() -> requests.Session:
+    """NSE's site blocks bare requests, so we warm up a session against
+    the homepage first (like a browser would) to pick up the cookies it
+    expects before hitting the actual data endpoint."""
+    session = requests.Session()
+    session.headers.update(_NSE_REQUEST_HEADERS)
+    session.get("https://www.nseindia.com/", timeout=10)
+    return session
 
 
 def fetch_all_nse_entries() -> List[dict]:
-    """Fetch NSE's official list of all listed equities, including each
-    stock's listing date. Falls back to a curated ~100-stock list (with
-    unknown listing dates) if the request fails for any reason.
-
-    NSE's site blocks bare requests, so we warm up a session against the
-    homepage first (like a browser would) to pick up the cookies it expects."""
+    """Fetch NSE's official list of all listed equities (symbol + listing
+    date). Falls back to a curated ~100-stock list if the request fails."""
     try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        })
-        session.get("https://www.nseindia.com/", timeout=10)  # picks up cookies
+        session = _nse_session()
         resp = session.get(NSE_EQUITY_LIST_URL, timeout=20)
         resp.raise_for_status()
-        reader = csv.DictReader(_io.StringIO(resp.text))
+        reader = csv.DictReader(io.StringIO(resp.text))
         fieldnames = reader.fieldnames or []
         symbol_key = next((f for f in fieldnames if f.strip().upper() == "SYMBOL"), "SYMBOL")
         listing_key = next((f for f in fieldnames if f.strip().upper() == "DATE OF LISTING"), None)
@@ -99,7 +127,7 @@ def fetch_all_nse_entries() -> List[dict]:
                 try:
                     listing_date = pd.Timestamp(datetime.strptime(raw_date, "%d-%b-%Y"))
                 except ValueError:
-                    listing_date = None  # unparseable, treat as unknown -> always include
+                    listing_date = None
             entries.append({"symbol": symbol, "listing_date": listing_date})
 
         if not entries:
@@ -110,8 +138,52 @@ def fetch_all_nse_entries() -> List[dict]:
         return FALLBACK_ENTRIES
 
 
+def fetch_symbol_history(symbol: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch daily OHLCV history for symbol (no .NS suffix) between
+    start and end (YYYY-MM-DD, end exclusive per yfinance convention).
+    Returns a DataFrame indexed by tz-naive date, or empty on failure."""
+    try:
+        hist = yf.Ticker(f"{symbol}.NS").history(start=start, end=end)
+        if hist.empty:
+            return hist
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_localize(None)
+        return hist
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_index_constituents(index_name: str) -> List[str]:
+    """Fetch the current constituent symbols for a named preset index
+    (e.g. 'Nifty 50', 'Nifty Bank'). Raises ValueError if the name isn't
+    a known preset, or RuntimeError if the fetch/parse fails."""
+    filename = INDEX_PRESETS.get(index_name)
+    if not filename:
+        raise ValueError(f"Unknown index preset: {index_name}")
+
+    try:
+        session = _nse_session()
+        resp = session.get(INDEX_LIST_BASE + filename, timeout=20)
+        resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
+        fieldnames = reader.fieldnames or []
+        symbol_key = next((f for f in fieldnames if f.strip().upper() == "SYMBOL"), None)
+        if not symbol_key:
+            raise RuntimeError(f"Unexpected CSV format for {index_name}")
+
+        symbols = [row[symbol_key].strip() for row in reader if row.get(symbol_key, "").strip()]
+        if not symbols:
+            raise RuntimeError(f"No symbols parsed for {index_name}")
+        return symbols
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch {index_name} constituents: {e}")
+
+
+_symbol_cache = {"entries": None, "fetched_at": None}
+
+
 def get_all_nse_entries() -> List[dict]:
-    """Returns the full NSE entry list (symbol + listing date), cached for 24 hours."""
+    """Live NSE entries (symbol + listing date), cached in-process for 24h."""
     now = datetime.utcnow()
     cached_at = _symbol_cache["fetched_at"]
     if _symbol_cache["entries"] is None or cached_at is None or (now - cached_at).total_seconds() > 86400:
@@ -149,6 +221,7 @@ class DayChange(BaseModel):
     label: str
     pct_change: float
     volume: int
+    volume_pct_change: Optional[float] = None
 
 
 class StockResult(BaseModel):
@@ -204,13 +277,9 @@ def evaluate_symbol(symbol: str, end_date_str: str, n_days: int) -> Optional[Sto
     fetch_start = (end_dt - timedelta(days=n_days * 3 + 25)).strftime("%Y-%m-%d")
     fetch_end = (end_dt + timedelta(days=15)).strftime("%Y-%m-%d")
 
-    ticker = f"{symbol}.NS"
-    hist = yf.Ticker(ticker).history(start=fetch_start, end=fetch_end)
+    hist = fetch_symbol_history(symbol, fetch_start, fetch_end)
     if hist.empty:
         return None
-
-    if hist.index.tz is not None:
-        hist.index = hist.index.tz_localize(None)
 
     valid_dates = hist.index[hist.index <= end_dt]
     if valid_dates.empty:
@@ -220,24 +289,53 @@ def evaluate_symbol(symbol: str, end_date_str: str, n_days: int) -> Optional[Sto
         return None
 
     window = hist.iloc[end_pos - n_days: end_pos + 1]
-    closes = window["Close"].tolist()
+    window_rows = [
+        {"date": idx.strftime("%Y-%m-%d"), "close": float(row["Close"]), "volume": int(row["Volume"])}
+        for idx, row in window.iterrows()
+    ]
+
+    next_row = None
+    if end_pos + 1 < len(hist):
+        next_idx = hist.index[end_pos + 1]
+        next_series = hist.iloc[end_pos + 1]
+        next_row = {
+            "date": next_idx.strftime("%Y-%m-%d"),
+            "close": float(next_series["Close"]),
+            "volume": int(next_series["Volume"]),
+        }
+
+    return _build_result_from_rows(symbol, window_rows, next_row)
+
+
+def _build_result_from_rows(symbol: str, window_rows: List[dict], next_row: Optional[dict]) -> Optional[StockResult]:
+    """Given a resolved n_days+1 window of rows (oldest first) plus an
+    optional next-trading-day row, compute the streak and build a
+    StockResult."""
+    closes = [r["close"] for r in window_rows]
     streak_len, direction = compute_streak(closes)
 
-    if streak_len < n_days or direction == "Flat":
+    if streak_len < len(window_rows) - 1 or direction == "Flat":
         return None
 
-    display = window.tail(n_days)
     net_pct = (closes[-1] - closes[0]) / closes[0] * 100
 
     days = []
-    for i, (date, day) in enumerate(display.iterrows(), start=1):
+    for i in range(1, len(window_rows)):
         prev_close = closes[i - 1]
         this_close = closes[i]
         day_pct = (this_close - prev_close) / prev_close * 100
+
+        prev_volume = window_rows[i - 1]["volume"]
+        this_volume = window_rows[i]["volume"]
+        volume_pct = ((this_volume - prev_volume) / prev_volume * 100) if prev_volume else None
+
+        row = window_rows[i]
+        date_label = row["date"] if isinstance(row["date"], str) else row["date"].strftime("%Y-%m-%d")
         days.append(DayChange(
-            label=f"Day {i} ({date.strftime('%d-%b-%Y')})",
+            label=f"Day {i} ({_pretty_date(date_label)})",
             pct_change=round(day_pct, 2),
-            volume=int(day["Volume"]),
+            volume=int(row["volume"]),
+            volume_pct_change=round(volume_pct, 2) if volume_pct is not None else None,
         ))
 
     next_day_label = None
@@ -245,11 +343,9 @@ def evaluate_symbol(symbol: str, end_date_str: str, n_days: int) -> Optional[Sto
     next_day_vol = None
     verdict = "No data yet for next trading day"
 
-    if end_pos + 1 < len(hist):
-        next_date = hist.index[end_pos + 1]
-        next_row = hist.iloc[end_pos + 1]
+    if next_row is not None:
         last_close = closes[-1]
-        next_pct = (next_row["Close"] - last_close) / last_close * 100
+        next_pct = (next_row["close"] - last_close) / last_close * 100
         next_dir = "Up" if next_pct > 0 else ("Down" if next_pct < 0 else "Flat")
 
         if next_dir == direction:
@@ -259,9 +355,10 @@ def evaluate_symbol(symbol: str, end_date_str: str, n_days: int) -> Optional[Sto
         else:
             verdict = f"Streak broken (reversed to {next_dir})"
 
-        next_day_label = f"Next day ({next_date.strftime('%d-%b-%Y')})"
+        next_date_label = next_row["date"] if isinstance(next_row["date"], str) else next_row["date"].strftime("%Y-%m-%d")
+        next_day_label = f"Next day ({_pretty_date(next_date_label)})"
         next_day_pct = round(next_pct, 2)
-        next_day_vol = int(next_row["Volume"])
+        next_day_vol = int(next_row["volume"])
 
     return StockResult(
         symbol=symbol,
@@ -273,6 +370,10 @@ def evaluate_symbol(symbol: str, end_date_str: str, n_days: int) -> Optional[Sto
         next_day_volume=next_day_vol,
         verdict=verdict,
     )
+
+
+def _pretty_date(date_str: str) -> str:
+    return datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%b-%Y")
 
 
 # ----------------------------------------------------------------------
@@ -333,6 +434,7 @@ def _write_sheet(wb: Workbook, sheet_name: str, stocks: List[StockResult], n_day
     for i in range(1, n_days + 1):
         headers.append(f"Day {i} % Change")
         headers.append(f"Day {i} Volume")
+        headers.append(f"Day {i} Volume % Change")
     headers += ["Next Day % Change", "Next Day Volume", "Verdict"]
 
     ws.append(headers)
@@ -351,6 +453,7 @@ def _write_sheet(wb: Workbook, sheet_name: str, stocks: List[StockResult], n_day
         for day in stock.days:
             row.append(day.pct_change)
             row.append(day.volume)
+            row.append(day.volume_pct_change if day.volume_pct_change is not None else "N/A")
         row.append(stock.next_day_pct_change if stock.next_day_pct_change is not None else "N/A")
         row.append(stock.next_day_volume if stock.next_day_volume is not None else "N/A")
         row.append(stock.verdict)
@@ -478,6 +581,32 @@ def get_report_excel(req: ReportRequest):
 @app.get("/api/default-symbols")
 def get_default_symbols_route(end_date: Optional[str] = None):
     symbols = get_default_symbols(end_date)
+    return {"symbols": symbols}
+
+
+_index_list_cache: dict = {}  # name -> {"symbols": [...], "fetched_at": datetime}
+
+
+@app.get("/api/index-presets")
+def get_index_presets():
+    return {"presets": list(INDEX_PRESETS.keys())}
+
+
+@app.get("/api/index-list")
+def get_index_list(name: str):
+    cached = _index_list_cache.get(name)
+    now = datetime.utcnow()
+    if cached and (now - cached["fetched_at"]).total_seconds() < 86400:
+        return {"symbols": cached["symbols"]}
+
+    try:
+        symbols = fetch_index_constituents(name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Unknown index preset: {name}")
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    _index_list_cache[name] = {"symbols": symbols, "fetched_at": now}
     return {"symbols": symbols}
 
 
