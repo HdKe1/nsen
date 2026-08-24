@@ -123,8 +123,23 @@ function pctClass(value) {
 function formatCountWithContinued(stocks) {
   const total = stocks.length;
   if (total === 0) return "0";
-  const continued = stocks.filter((s) => s.verdict && s.verdict.includes("continued")).length;
-  return continued > 0 ? `${total} (${continued} continued)` : `${total}`;
+
+  let continued = 0, broken = 0, paused = 0, pending = 0;
+  stocks.forEach((s) => {
+    const v = s.verdict || "";
+    if (v.includes("continued")) continued++;
+    else if (v.includes("broken")) broken++;
+    else if (v.includes("paused")) paused++;
+    else pending++;
+  });
+
+  const parts = [];
+  if (continued > 0) parts.push(`${continued} continued`);
+  if (broken > 0) parts.push(`${broken} broken`);
+  if (paused > 0) parts.push(`${paused} paused`);
+  if (pending > 0) parts.push(`${pending} pending`);
+
+  return parts.length > 0 ? `${total} (${parts.join(", ")})` : `${total}`;
 }
 
 function renderRow(stock) {
