@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import io
 import json
+import threading
 
 import pandas as pd
 import requests
@@ -153,6 +154,69 @@ def fetch_symbol_history(symbol: str, start: str, end: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ----------------------------------------------------------------------
+# NSE delivery data (deliverable quantity / % delivered)
+# ----------------------------------------------------------------------
+# NSE publishes one bhavcopy-with-delivery CSV per trading day, covering
+# EVERY listed symbol -- so unlike price history (per-symbol via
+# yfinance), we only need to fetch ONE file per date, then look up
+# whichever symbols we need from it. A report's window covers the same
+# handful of dates across every symbol, so this is cheap even at scale.
+
+_delivery_cache: dict = {}  # date_str (YYYY-MM-DD) -> {symbol: {"deliv_qty": int, "deliv_per": float}}
+_delivery_cache_lock = threading.Lock()
+
+
+def get_delivery_data_for_date(date_str: str) -> dict:
+    """Returns {symbol: {"deliv_qty": int, "deliv_per": float}} for the
+    given date, or {} if the file isn't available (e.g. too old, or a
+    non-trading day). Cached per date since it's the same file for every
+    symbol and never changes once published."""
+    with _delivery_cache_lock:
+        if date_str in _delivery_cache:
+            return _delivery_cache[date_str]
+
+    ddmmyyyy = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d%m%Y")
+    url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
+
+    result = {}
+    try:
+        session = _nse_session()
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
+        fieldnames = [f.strip() for f in (reader.fieldnames or [])]
+        # Columns come with inconsistent spacing across NSE's exports
+        key_map = {f.strip().upper(): f for f in (reader.fieldnames or [])}
+        symbol_key = key_map.get("SYMBOL")
+        series_key = key_map.get("SERIES")
+        deliv_qty_key = key_map.get("DELIV_QTY")
+        deliv_per_key = key_map.get("DELIV_PER")
+
+        if symbol_key and deliv_qty_key and deliv_per_key:
+            for row in reader:
+                if series_key and (row.get(series_key) or "").strip() != "EQ":
+                    continue  # only regular equity series, skip debt/SME/etc.
+                sym = (row.get(symbol_key) or "").strip()
+                if not sym:
+                    continue
+                try:
+                    qty_raw = (row.get(deliv_qty_key) or "").strip()
+                    per_raw = (row.get(deliv_per_key) or "").strip()
+                    deliv_qty = int(float(qty_raw)) if qty_raw and qty_raw != "-" else None
+                    deliv_per = float(per_raw) if per_raw and per_raw != "-" else None
+                except ValueError:
+                    deliv_qty, deliv_per = None, None
+                result[sym] = {"deliv_qty": deliv_qty, "deliv_per": deliv_per}
+    except Exception as e:
+        print(f"Could not fetch delivery data for {date_str}: {e}")
+        result = {}
+
+    with _delivery_cache_lock:
+        _delivery_cache[date_str] = result
+    return result
+
+
 def fetch_index_constituents(index_name: str) -> List[str]:
     """Fetch the current constituent symbols for a named preset index
     (e.g. 'Nifty 50', 'Nifty Bank'). Raises ValueError if the name isn't
@@ -222,6 +286,8 @@ class DayChange(BaseModel):
     pct_change: float
     volume: int
     volume_pct_change: Optional[float] = None
+    deliv_qty: Optional[int] = None
+    deliv_per: Optional[float] = None
 
 
 class StockResult(BaseModel):
@@ -232,6 +298,9 @@ class StockResult(BaseModel):
     next_day_label: Optional[str]
     next_day_pct_change: Optional[float]
     next_day_volume: Optional[int]
+    next_day_volume_pct_change: Optional[float] = None
+    next_day_deliv_qty: Optional[int] = None
+    next_day_deliv_per: Optional[float] = None
     verdict: str
 
 
@@ -331,16 +400,24 @@ def _build_result_from_rows(symbol: str, window_rows: List[dict], next_row: Opti
 
         row = window_rows[i]
         date_label = row["date"] if isinstance(row["date"], str) else row["date"].strftime("%Y-%m-%d")
+
+        deliv = get_delivery_data_for_date(date_label).get(symbol, {})
+
         days.append(DayChange(
             label=f"Day {i} ({_pretty_date(date_label)})",
             pct_change=round(day_pct, 2),
             volume=int(row["volume"]),
             volume_pct_change=round(volume_pct, 2) if volume_pct is not None else None,
+            deliv_qty=deliv.get("deliv_qty"),
+            deliv_per=deliv.get("deliv_per"),
         ))
 
     next_day_label = None
     next_day_pct = None
     next_day_vol = None
+    next_day_vol_pct = None
+    next_day_deliv_qty = None
+    next_day_deliv_per = None
     verdict = "No data yet for next trading day"
 
     if next_row is not None:
@@ -360,6 +437,15 @@ def _build_result_from_rows(symbol: str, window_rows: List[dict], next_row: Opti
         next_day_pct = round(next_pct, 2)
         next_day_vol = int(next_row["volume"])
 
+        last_volume = window_rows[-1]["volume"]
+        if last_volume:
+            next_day_vol_pct = round((next_day_vol - last_volume) / last_volume * 100, 2)
+
+        next_date_str = next_row["date"] if isinstance(next_row["date"], str) else next_row["date"].strftime("%Y-%m-%d")
+        next_deliv = get_delivery_data_for_date(next_date_str).get(symbol, {})
+        next_day_deliv_qty = next_deliv.get("deliv_qty")
+        next_day_deliv_per = next_deliv.get("deliv_per")
+
     return StockResult(
         symbol=symbol,
         direction=direction,
@@ -368,6 +454,9 @@ def _build_result_from_rows(symbol: str, window_rows: List[dict], next_row: Opti
         next_day_label=next_day_label,
         next_day_pct_change=next_day_pct,
         next_day_volume=next_day_vol,
+        next_day_volume_pct_change=next_day_vol_pct,
+        next_day_deliv_qty=next_day_deliv_qty,
+        next_day_deliv_per=next_day_deliv_per,
         verdict=verdict,
     )
 
@@ -435,7 +524,12 @@ def _write_sheet(wb: Workbook, sheet_name: str, stocks: List[StockResult], n_day
         headers.append(f"Day {i} % Change")
         headers.append(f"Day {i} Volume")
         headers.append(f"Day {i} Volume % Change")
-    headers += ["Next Day % Change", "Next Day Volume", "Verdict"]
+        headers.append(f"Day {i} Delivery Qty")
+        headers.append(f"Day {i} Delivery %")
+    headers += [
+        "Next Day % Change", "Next Day Volume", "Next Day Volume % Change",
+        "Next Day Delivery Qty", "Next Day Delivery %", "Verdict",
+    ]
 
     ws.append(headers)
     header_font = Font(bold=True, color="FFFFFF")
@@ -454,8 +548,13 @@ def _write_sheet(wb: Workbook, sheet_name: str, stocks: List[StockResult], n_day
             row.append(day.pct_change)
             row.append(day.volume)
             row.append(day.volume_pct_change if day.volume_pct_change is not None else "N/A")
+            row.append(day.deliv_qty if day.deliv_qty is not None else "N/A")
+            row.append(day.deliv_per if day.deliv_per is not None else "N/A")
         row.append(stock.next_day_pct_change if stock.next_day_pct_change is not None else "N/A")
         row.append(stock.next_day_volume if stock.next_day_volume is not None else "N/A")
+        row.append(stock.next_day_volume_pct_change if stock.next_day_volume_pct_change is not None else "N/A")
+        row.append(stock.next_day_deliv_qty if stock.next_day_deliv_qty is not None else "N/A")
+        row.append(stock.next_day_deliv_per if stock.next_day_deliv_per is not None else "N/A")
         row.append(stock.verdict)
         ws.append(row)
 

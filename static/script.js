@@ -120,6 +120,15 @@ function pctClass(value) {
   return value >= 0 ? "pos" : "neg";
 }
 
+function formatVolume(value) {
+  if (value === null || value === undefined) return "—";
+  const abs = Math.abs(value);
+  if (abs >= 1e7) return `${(value / 1e7).toFixed(2)}Cr`;
+  if (abs >= 1e5) return `${(value / 1e5).toFixed(2)}L`;
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+  return `${value}`;
+}
+
 function formatCountWithContinued(stocks) {
   const total = stocks.length;
   if (total === 0) return "0";
@@ -162,14 +171,25 @@ function renderRow(stock) {
     chip.appendChild(priceLine);
 
     const volumeLine = document.createElement("span");
+    const volumeCount = formatVolume(d.volume);
     if (d.volume_pct_change === null || d.volume_pct_change === undefined) {
       volumeLine.className = "volume-line";
-      volumeLine.textContent = "vol —";
+      volumeLine.textContent = `vol — · ${volumeCount}`;
     } else {
       volumeLine.className = `volume-line ${pctClass(d.volume_pct_change)}`;
-      volumeLine.textContent = `vol ${fmtPct(d.volume_pct_change)}`;
+      volumeLine.textContent = `vol ${fmtPct(d.volume_pct_change)} · ${volumeCount}`;
     }
     chip.appendChild(volumeLine);
+
+    if (d.deliv_qty !== null && d.deliv_qty !== undefined) {
+      const delivLine = document.createElement("span");
+      delivLine.className = "deliv-line";
+      const delivPerText = d.deliv_per !== null && d.deliv_per !== undefined
+        ? `${d.deliv_per.toFixed(1)}%`
+        : "—";
+      delivLine.textContent = `deliv ${delivPerText} · ${formatVolume(d.deliv_qty)}`;
+      chip.appendChild(delivLine);
+    }
 
     daysTd.appendChild(chip);
   });
@@ -186,10 +206,31 @@ function renderRow(stock) {
     const pctSpan = document.createElement("span");
     pctSpan.className = `pct ${pctClass(stock.next_day_pct_change)}`;
     pctSpan.textContent = fmtPct(stock.next_day_pct_change);
-    pctSpan.title = stock.next_day_volume !== null
-      ? `Volume ${stock.next_day_volume.toLocaleString("en-IN")}`
-      : "";
     nextTd.appendChild(pctSpan);
+
+    if (stock.next_day_volume !== null && stock.next_day_volume !== undefined) {
+      const volSpan = document.createElement("span");
+      const volCount = formatVolume(stock.next_day_volume);
+      if (stock.next_day_volume_pct_change !== null && stock.next_day_volume_pct_change !== undefined) {
+        volSpan.className = `volume-line ${pctClass(stock.next_day_volume_pct_change)}`;
+        volSpan.textContent = `vol ${fmtPct(stock.next_day_volume_pct_change)} · ${volCount}`;
+      } else {
+        volSpan.className = "volume-line";
+        volSpan.textContent = volCount;
+      }
+      nextTd.appendChild(volSpan);
+    }
+
+    if (stock.next_day_deliv_qty !== null && stock.next_day_deliv_qty !== undefined) {
+      const delivSpan = document.createElement("span");
+      delivSpan.className = "deliv-line";
+      const delivPerText = stock.next_day_deliv_per !== null && stock.next_day_deliv_per !== undefined
+        ? `${stock.next_day_deliv_per.toFixed(1)}%`
+        : "—";
+      delivSpan.textContent = `deliv ${delivPerText} · ${formatVolume(stock.next_day_deliv_qty)}`;
+      nextTd.appendChild(delivSpan);
+    }
+
     const labelSpan = document.createElement("span");
     labelSpan.className = "label";
     labelSpan.textContent = stock.next_day_label || "";
@@ -345,9 +386,14 @@ function buildStockRow(stock, nDays) {
     row.push(d.pct_change);
     row.push(d.volume);
     row.push(d.volume_pct_change ?? "N/A");
+    row.push(d.deliv_qty ?? "N/A");
+    row.push(d.deliv_per ?? "N/A");
   });
   row.push(stock.next_day_pct_change ?? "N/A");
   row.push(stock.next_day_volume ?? "N/A");
+  row.push(stock.next_day_volume_pct_change ?? "N/A");
+  row.push(stock.next_day_deliv_qty ?? "N/A");
+  row.push(stock.next_day_deliv_per ?? "N/A");
   row.push(stock.verdict);
   return row;
 }
@@ -357,9 +403,15 @@ function addStreakSheet(workbook, sheetName, stocks, nDays) {
 
   const headers = ["Symbol", "Streak Type", "Net % Change"];
   for (let i = 1; i <= nDays; i++) {
-    headers.push(`Day ${i} % Change`, `Day ${i} Volume`, `Day ${i} Volume % Change`);
+    headers.push(
+      `Day ${i} % Change`, `Day ${i} Volume`, `Day ${i} Volume % Change`,
+      `Day ${i} Delivery Qty`, `Day ${i} Delivery %`
+    );
   }
-  headers.push("Next Day % Change", "Next Day Volume", "Verdict");
+  headers.push(
+    "Next Day % Change", "Next Day Volume", "Next Day Volume % Change",
+    "Next Day Delivery Qty", "Next Day Delivery %", "Verdict"
+  );
 
   const headerRow = sheet.addRow(headers);
   headerRow.eachCell((cell) => {

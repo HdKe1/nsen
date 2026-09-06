@@ -372,6 +372,18 @@ table.ledger tbody tr:hover {
 .day-chip .volume-line.pos { color: var(--up); opacity: 0.75; }
 .day-chip .volume-line.neg { color: var(--down); opacity: 0.75; }
 
+.day-chip .deliv-line,
+.next-cell .deliv-line {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.7;
+  margin-top: 1px;
+}
+
+.next-cell .deliv-line {
+  display: block;
+}
+
 .net-cell {
   text-align: right;
   font-weight: 600;
@@ -384,8 +396,17 @@ table.ledger tbody tr:hover {
   text-align: right;
 }
 
+.next-cell .pct {
+  display: block;
+}
+
 .next-cell .pct.pos { color: var(--up); }
 .next-cell .pct.neg { color: var(--down); }
+
+.next-cell .volume-line {
+  display: block;
+  margin-top: 1px;
+}
 
 .next-cell .label {
   display: block;
