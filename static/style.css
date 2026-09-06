@@ -375,8 +375,7 @@ table.ledger tbody tr:hover {
 .day-chip .deliv-line,
 .next-cell .deliv-line {
   font-size: 10px;
-  color: var(--muted);
-  opacity: 0.7;
+  color: var(--ink);
   margin-top: 1px;
 }
 
